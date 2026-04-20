@@ -1,0 +1,154 @@
+name: 'mcp-audit'
+description: 'Static security audit of Model Context Protocol (MCP) servers — detects prompt injection, tool poisoning, lethal trifecta, and other AI-native vulnerabilities. Surfaces findings in the GitHub Security tab via SARIF.'
+author: 'Arthur Abrego (@dj_abstract)'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  manifest:
+    description: 'Path to a static MCP server manifest JSON (extracted via your build or mcp-audit-sweep). Mutually exclusive with `stdio` and `url`.'
+    required: false
+  stdio:
+    description: 'Command to spawn a local stdio-backed MCP server (e.g. `node ./server.js`). Mutually exclusive with `manifest` and `url`.'
+    required: false
+  url:
+    description: 'URL of a remote HTTP/SSE MCP server. Mutually exclusive with `manifest` and `stdio`.'
+    required: false
+  bearer:
+    description: 'Bearer token for remote HTTP/SSE servers that require authentication.'
+    required: false
+  fail-on:
+    description: 'Minimum severity that fails the build: critical | high | medium | low. Default is `high`.'
+    required: false
+    default: 'high'
+  sarif-file:
+    description: 'Where to write the SARIF report (relative to workspace). Default `mcp-audit.sarif`.'
+    required: false
+    default: 'mcp-audit.sarif'
+  upload-sarif:
+    description: 'When `true`, uploads the SARIF to the GitHub Code Scanning dashboard using `github/codeql-action/upload-sarif`. Requires `security-events: write` permission on the workflow.'
+    required: false
+    default: 'true'
+  mcp-audit-version:
+    description: 'Version of @dj_abstract/mcp-audit to run. Default `latest`. Pin to a specific version (e.g. `0.4.0`) for reproducible CI.'
+    required: false
+    default: 'latest'
+
+outputs:
+  sarif-file:
+    description: 'Path to the generated SARIF report.'
+    value: ${{ steps.scan.outputs.sarif-file }}
+  finding-count:
+    description: 'Total number of findings.'
+    value: ${{ steps.scan.outputs.finding-count }}
+  critical-count:
+    description: 'Number of critical-severity findings.'
+    value: ${{ steps.scan.outputs.critical-count }}
+  high-count:
+    description: 'Number of high-severity findings.'
+    value: ${{ steps.scan.outputs.high-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        count=0
+        [ -n "${{ inputs.manifest }}" ] && count=$((count+1)) || true
+        [ -n "${{ inputs.stdio }}" ] && count=$((count+1)) || true
+        [ -n "${{ inputs.url }}" ] && count=$((count+1)) || true
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Provide exactly one of: manifest, stdio, url (got $count)"
+          exit 2
+        fi
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Run mcp-audit
+      id: scan
+      shell: bash
+      env:
+        MCP_AUDIT_VERSION: ${{ inputs.mcp-audit-version }}
+        MANIFEST: ${{ inputs.manifest }}
+        STDIO: ${{ inputs.stdio }}
+        URL: ${{ inputs.url }}
+        BEARER: ${{ inputs.bearer }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
+      run: |
+        set -euo pipefail
+
+        ARGS=()
+        if [ -n "$MANIFEST" ]; then ARGS+=( --manifest "$MANIFEST" ); fi
+        if [ -n "$STDIO" ]; then ARGS+=( --stdio "$STDIO" ); fi
+        if [ -n "$URL" ]; then
+          ARGS+=( --url "$URL" )
+          if [ -n "$BEARER" ]; then ARGS+=( --bearer "$BEARER" ); fi
+        fi
+        ARGS+=( --sarif "$SARIF_FILE" )
+        # Always emit JSON too — we parse it for output counts.
+        ARGS+=( --json "${SARIF_FILE%.sarif}.json" --quiet )
+
+        # Don't let the CLI fail-on short-circuit the upload. We apply fail-on
+        # ourselves AFTER SARIF upload so the findings reach the Security tab
+        # even on failing PRs.
+        set +e
+        npx -y "@dj_abstract/mcp-audit@${MCP_AUDIT_VERSION}" scan "${ARGS[@]}"
+        SCAN_EXIT=$?
+        set -e
+
+        echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
+
+        # Read counts from the JSON report and expose them as outputs.
+        JSON_FILE="${SARIF_FILE%.sarif}.json"
+        if [ -f "$JSON_FILE" ]; then
+          node -e "
+            const r = JSON.parse(require('fs').readFileSync('$JSON_FILE','utf8'));
+            const s = r.summary || {};
+            const bs = s.bySeverity || {};
+            const fs = require('fs');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'finding-count=' + (s.total||0) + '\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'critical-count=' + (bs.critical||0) + '\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'high-count=' + (bs.high||0) + '\n');
+          "
+        fi
+
+        echo "scan-exit=$SCAN_EXIT" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-file) != '' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: 'mcp-audit'
+
+    - name: Apply fail-on threshold
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        CRITICAL: ${{ steps.scan.outputs.critical-count }}
+        HIGH: ${{ steps.scan.outputs.high-count }}
+      run: |
+        set -euo pipefail
+        WORST=0
+        [ "${CRITICAL:-0}" -gt 0 ] && WORST=4
+        [ "$WORST" -lt 3 ] && [ "${HIGH:-0}" -gt 0 ] && WORST=3
+        case "$FAIL_ON" in
+          critical) THRESH=4 ;;
+          high)     THRESH=3 ;;
+          medium)   THRESH=2 ;;
+          low)      THRESH=1 ;;
+          *)        echo "::warning::unknown fail-on value '$FAIL_ON'; defaulting to high"; THRESH=3 ;;
+        esac
+        if [ "$WORST" -ge "$THRESH" ]; then
+          echo "::error::mcp-audit found findings at or above severity=$FAIL_ON (critical=$CRITICAL high=$HIGH)"
+          exit 1
+        fi
+        echo "::notice::mcp-audit passed fail-on=$FAIL_ON (critical=$CRITICAL high=$HIGH)"

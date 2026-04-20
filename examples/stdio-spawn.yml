@@ -1,0 +1,25 @@
+name: MCP Audit — stdio spawn
+
+on: [pull_request]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm ci && npm run build
+
+      - name: Audit the built server
+        uses: abregoarthur-star/mcp-audit-action@v1
+        with:
+          stdio: 'node ./dist/server.js'
+          fail-on: critical

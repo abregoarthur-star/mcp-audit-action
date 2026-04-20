@@ -1,0 +1,26 @@
+name: MCP Audit
+
+on:
+  pull_request:
+    paths:
+      - 'mcp-manifest.json'
+      - 'src/mcp-server.*'
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: mcp-audit scan
+        id: audit
+        uses: abregoarthur-star/mcp-audit-action@v1
+        with:
+          manifest: ./mcp-manifest.json
+          fail-on: high
