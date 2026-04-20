@@ -1,5 +1,5 @@
 name: 'mcp-audit'
-description: 'Static security audit of Model Context Protocol (MCP) servers — detects prompt injection, tool poisoning, lethal trifecta, and other AI-native vulnerabilities. Surfaces findings in the GitHub Security tab via SARIF.'
+description: 'Static security audit for MCP servers — prompt injection, tool poisoning, lethal trifecta. SARIF for GitHub Code Scanning.'
 author: 'Arthur Abrego (@dj_abstract)'
 branding:
   icon: 'shield'
